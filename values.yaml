@@ -1,0 +1,13 @@
+prometheus:
+  prometheusSpec:
+    externalLabels:
+      cluster: minikube
+
+alertmanager:
+  alertmanagerSpec:
+    alertmanagerConfigSelector:
+      matchLabels:
+        release: monitoring
+    alertmanagerConfigNamespaceSelector: {}
+    secrets:
+      - telegram-bot-token

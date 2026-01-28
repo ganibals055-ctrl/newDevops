@@ -1,0 +1,29 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "DogRatingService", "DogRatingService", "{FA18DCB3-A889-A4F3-08CA-F3266A94110B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "rating-service", "DogRatingService\rating-service.csproj", "{465EE765-DF2B-B2AE-CE5A-B995E00609AF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{465EE765-DF2B-B2AE-CE5A-B995E00609AF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{465EE765-DF2B-B2AE-CE5A-B995E00609AF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{465EE765-DF2B-B2AE-CE5A-B995E00609AF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{465EE765-DF2B-B2AE-CE5A-B995E00609AF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{465EE765-DF2B-B2AE-CE5A-B995E00609AF} = {FA18DCB3-A889-A4F3-08CA-F3266A94110B}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {9292819F-7917-4FC6-9E12-F478358A2401}
+	EndGlobalSection
+EndGlobal

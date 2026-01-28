@@ -1,0 +1,20 @@
+services:
+  jenkins-docker:
+    build: .
+    user: root
+    privileged: true
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config.jenkins:/var/jenkins_home/.kube/config 
+      - ~/.minikube:/var/jenkins_home/.minikube
+    extra_hosts:
+      - "host.minikube.internal:host-gateway" 
+
+volumes:
+  jenkins-data:

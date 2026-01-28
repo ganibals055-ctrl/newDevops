@@ -1,0 +1,72 @@
+pipeline {
+    agent any
+    
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
+        DEPLOY_PATH = '_devops/k8s'
+        REGISTRY = "localhost:5000"
+        REGISTRY_MINIKUBE = "host.minikube.internal:5000"
+        IMAGE_RATING = "doggo-rating-service"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(env.SHARED_WS) {
+                    checkout scm
+                }
+                script {
+                    dir(env.SHARED_WS) {
+                        env.VERSION = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+                        echo "VERSION = ${env.VERSION}"
+                    }
+                }
+            }
+        }
+
+        stage('Docker build') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh 'docker build -t ${REGISTRY}/${IMAGE_RATING}:${VERSION} DogRatingService'
+                }
+            }
+        }
+
+        stage('Push to registry') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        docker login ${REGISTRY} -u user -p user
+                        docker push ${REGISTRY}/${IMAGE_RATING}:${VERSION}
+                        docker rmi ${REGISTRY}/${IMAGE_RATING}:${VERSION} || true
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to k8s') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        sed -i "s|image-rating-replace|${REGISTRY_MINIKUBE}/${IMAGE_RATING}:${VERSION}|g" ${DEPLOY_PATH}/doggo-rating-deployment.yaml
+                        kubectl apply -f ${DEPLOY_PATH}
+                        kubectl rollout status deployment/doggo --timeout=60s
+                        kubectl rollout status deployment/doggo-rating --timeout=60s
+                        kubectl rollout status deployment/postgres --timeout=60s || true
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "docker logout ${REGISTRY}"
+            cleanWs()
+        }
+    }
+}

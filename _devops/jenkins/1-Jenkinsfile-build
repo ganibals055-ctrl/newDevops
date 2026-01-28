@@ -1,0 +1,105 @@
+pipeline {
+    agent any
+    
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
+        DEPLOY_PATH = '_devops/k8s'
+        REGISTRY = "localhost:5000"
+        REGISTRY_MINIKUBE = "host.minikube.internal:5000"
+        IMAGE_RANDOM = "doggo-random-service"
+        IMAGE_RATING = "doggo-rating-service"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(env.SHARED_WS) {
+                    checkout scm
+                }
+                script {
+                    dir(env.SHARED_WS) {
+                        env.VERSION = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+                        echo "VERSION = ${env.VERSION}"
+                    }
+                }
+            }
+        }
+
+        stage('Docker build') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        docker build -t ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} DogRandomService
+                        docker build -t ${REGISTRY}/${IMAGE_RATING}:${VERSION} DogRatingService
+                    """
+                }
+            }
+        }
+
+        stage('Push to registry') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        docker login ${REGISTRY} -u user -p user
+                        docker push ${REGISTRY}/${IMAGE_RANDOM}:${VERSION}
+                        docker push ${REGISTRY}/${IMAGE_RATING}:${VERSION}
+                        docker rmi ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} || true
+                        docker rmi ${REGISTRY}/${IMAGE_RATING}:${VERSION} || true
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to k8s') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        cp ${DEPLOY_PATH}/doggo-deployment.yaml ${DEPLOY_PATH}/doggo-deployment-temp.yaml
+                        cp ${DEPLOY_PATH}/doggo-rating-deployment.yaml ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
+                
+                        sed -i "s|image-doggo-replace|${REGISTRY_MINIKUBE}/${IMAGE_RANDOM}:${VERSION}|g" ${DEPLOY_PATH}/doggo-deployment-temp.yaml
+                        sed -i "s|image-rating-replace|${REGISTRY_MINIKUBE}/${IMAGE_RATING}:${VERSION}|g" ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
+                
+                        kubectl apply -f ${DEPLOY_PATH}/configmap.yaml
+                        kubectl apply -f ${DEPLOY_PATH}/secret.yaml
+                        kubectl apply -f ${DEPLOY_PATH}/nexus-secret.yaml
+                        kubectl apply -f ${DEPLOY_PATH}/postgres.yaml
+                
+                        sleep 15
+                        kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
+                
+                        kubectl apply -f ${DEPLOY_PATH}/doggo-deployment-temp.yaml
+                        kubectl apply -f ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
+                
+                        rm -f ${DEPLOY_PATH}/*-temp.yaml
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            dir(env.SHARED_WS) {
+                sh """
+                    kubectl delete -f ${DEPLOY_PATH} --ignore-not-found=true
+                    kubectl delete all -l app=doggo --ignore-not-found=true
+                    kubectl delete all -l app=doggo-rating --ignore-not-found=true
+                    kubectl delete all -l app=postgres --ignore-not-found=true
+                    kubectl delete pvc postgres-data --ignore-not-found=true
+                    kubectl delete configmap doggo-env --ignore-not-found=true
+                    kubectl delete secret doggo-secret --ignore-not-found=true
+                    kubectl delete secret nexus-secret --ignore-not-found=true
+                """
+            }
+        }
+        always {
+            sh "docker logout ${REGISTRY}"
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,42 @@
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
+        DEPLOY_PATH = '_devops/k8s'
+    }
+
+    stages {
+        stage('Clean k8s') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        kubectl delete -f ${DEPLOY_PATH} --ignore-not-found=true
+                        kubectl wait --for=delete pod -l app=doggo --timeout=30s || true
+                        kubectl wait --for=delete pod -l app=doggo-rating --timeout=30s || true
+                        kubectl wait --for=delete pod -l app=postgres --timeout=30s || true
+                        kubectl delete all -l app=doggo --ignore-not-found=true
+                        kubectl delete all -l app=doggo-rating --ignore-not-found=true
+                        kubectl delete all -l app=postgres --ignore-not-found=true
+                        kubectl delete pvc postgres-data --ignore-not-found=true
+                        kubectl delete configmap doggo-env --ignore-not-found=true
+                        kubectl delete secret doggo-secret --ignore-not-found=true
+                        kubectl delete secret nexus-secret --ignore-not-found=true
+                    """
+                }
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                dir(env.SHARED_WS) {
+                    cleanWs()
+                }
+            }
+        }
+    }
+}

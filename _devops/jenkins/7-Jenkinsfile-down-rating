@@ -1,0 +1,22 @@
+pipeline {
+    agent any
+    
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
+        DEPLOY_PATH = '_devops/k8s'
+    }
+
+    stages {
+        stage('Deploy to k8s') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh 'kubectl scale deployment/doggo-rating --replicas=0'
+                }
+            }
+        }
+    }
+}
