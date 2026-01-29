@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using RatingCommentsService.Data;
 using RatingCommentsService.Models;
 using RatingCommentsService.Models.Dto;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -11,8 +12,10 @@ var builder = WebApplication.CreateBuilder(args);
 var conn =
     builder.Configuration.GetConnectionString("Postgres")
     ?? builder.Configuration["ConnectionStrings:Postgres"]
-    ?? Environment.GetEnvironmentVariable("ConnectionStrings__Postgres")
-    ?? "Host=postgres;Port=5432;Database=dogs;Username=postgres;Password=postgres";
+    ?? Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
+    ?? "Host=localhost;Port=5432;Database=dogs;Username=postgres;Password=postgres";
+
+Console.WriteLine($"Using connection string: {conn.Substring(0, Math.Min(50, conn.Length))}...");
 
 // ----------------------------------------------------------------
 // EF Core + PostgreSQL
@@ -23,7 +26,11 @@ builder.Services.AddDbContext<AppDb>(opt =>
 });
 
 // JSON
-builder.Services.AddControllers().AddJsonOptions(opt => { });
+builder.Services.AddControllers().AddJsonOptions(opt => 
+{
+    opt.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+    opt.JsonSerializerOptions.WriteIndented = true;
+});
 
 // Swagger
 builder.Services.AddEndpointsApiExplorer();
@@ -32,15 +39,17 @@ builder.Services.AddSwaggerGen();
 // CORS
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("allowAll", policy =>
+    options.AddPolicy("AllowAll", policy =>
     {
-        policy
-            .AllowAnyOrigin()
-            .AllowAnyMethod()
-            .AllowAnyHeader();
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
     });
 });
+
+// Simple Health Checks (без дополнительных пакетов)
 builder.Services.AddHealthChecks();
+
 var app = builder.Build();
 
 // ----------------------------------------------------------------
@@ -49,29 +58,21 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDb>();
-    var disableEf = Environment.GetEnvironmentVariable("DOTNET_EF_DISABLED");
-
+    
     try
     {
-        if (string.IsNullOrEmpty(disableEf))
-        {
-            db.Database.Migrate();
-            Console.WriteLine(">>> Migrations applied.");
-        }
-        else
-        {
-            db.Database.EnsureCreated();
-            Console.WriteLine(">>> EnsureCreated executed.");
-        }
+        Console.WriteLine("Creating database...");
+        db.Database.EnsureCreated();
+        Console.WriteLine("Database created successfully.");
     }
     catch (Exception ex)
     {
-        Console.WriteLine("DB init error: " + ex.Message);
+        Console.WriteLine($"Database error: {ex.Message}");
     }
 }
 
 // ----------------------------------------------------------------
-// Development tools
+// Middleware pipeline
 // ----------------------------------------------------------------
 if (app.Environment.IsDevelopment())
 {
@@ -80,69 +81,98 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+app.UseCors("AllowAll");
+
+// Health check endpoint
+app.MapGet("/health", () => Results.Ok(new { status = "OK", timestamp = DateTime.UtcNow }));
+
 // ----------------------------------------------------------------
 // API endpoints
 // ----------------------------------------------------------------
-app.UseCors("allowAll");
-app.MapHealthChecks("/health");
+
 // POST /ratings/{dogId}
 app.MapPost("/ratings/{dogId:long}", async (long dogId, CreateRatingDto dto, AppDb db) =>
 {
-    if (dto.Value < 1 || dto.Value > 5) return Results.BadRequest("Value must be 1..5");
+    if (dto.Value < 1 || dto.Value > 5) 
+        return Results.BadRequest(new { error = "Value must be between 1 and 5" });
 
-    var r = new DogRating { DogId = dogId, Value = dto.Value };
-    db.Ratings.Add(r);
+    var rating = new DogRating 
+    { 
+        DogId = dogId, 
+        Value = dto.Value,
+        CreatedAt = DateTime.UtcNow
+    };
+    
+    db.Ratings.Add(rating);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/ratings/{r.Id}", r);
+    return Results.Created($"/ratings/{rating.Id}", rating);
 });
 
 // GET /ratings/{dogId}
 app.MapGet("/ratings/{dogId:long}", async (long dogId, AppDb db) =>
 {
-    var list = await db.Ratings
+    var ratings = await db.Ratings
         .Where(x => x.DogId == dogId)
         .OrderByDescending(x => x.CreatedAt)
         .ToListAsync();
 
-    return Results.Ok(list);
+    return Results.Ok(ratings);
 });
 
 // GET /ratings/{dogId}/avg
 app.MapGet("/ratings/{dogId:long}/avg", async (long dogId, AppDb db) =>
 {
-    var avg = await db.Ratings
+    var average = await db.Ratings
         .Where(x => x.DogId == dogId)
         .AverageAsync(x => (double?)x.Value);
 
-    return Results.Ok(new { dogId, avg = avg ?? 0 });
+    return Results.Ok(new 
+    { 
+        dogId, 
+        average = average ?? 0,
+        totalRatings = await db.Ratings.CountAsync(x => x.DogId == dogId)
+    });
 });
 
 // POST /comments/{dogId}
 app.MapPost("/comments/{dogId:long}", async (long dogId, CreateCommentDto dto, AppDb db) =>
 {
     if (string.IsNullOrWhiteSpace(dto.Text))
-        return Results.BadRequest("Text required");
+        return Results.BadRequest(new { error = "Comment text is required" });
 
-    var c = new DogComment { DogId = dogId, Text = dto.Text };
-    db.Comments.Add(c);
+    var comment = new DogComment 
+    { 
+        DogId = dogId, 
+        Text = dto.Text.Trim(),
+        CreatedAt = DateTime.UtcNow
+    };
+    
+    db.Comments.Add(comment);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/comments/{c.Id}", c);
+    return Results.Created($"/comments/{comment.Id}", comment);
 });
 
 // GET /comments/{dogId}
 app.MapGet("/comments/{dogId:long}", async (long dogId, AppDb db) =>
 {
-    var list = await db.Comments
+    var comments = await db.Comments
         .Where(x => x.DogId == dogId)
         .OrderByDescending(x => x.CreatedAt)
         .ToListAsync();
 
-    return Results.Ok(list);
+    return Results.Ok(comments);
 });
 
-app.MapMethods("{*path}", new[] { "OPTIONS" }, () => Results.Ok());
+// GET /status - simple status endpoint
+app.MapGet("/status", () => Results.Ok(new { status = "OK", timestamp = DateTime.UtcNow }));
+
+// Handle OPTIONS for CORS
+app.MapMethods("/{*path}", new[] { "OPTIONS" }, () => Results.Ok());
 
 // ----------------------------------------------------------------
+// Start the app
+// ----------------------------------------------------------------
+Console.WriteLine($"Starting Dog Rating Service on port: {Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? "8081"}");
 app.Run();
