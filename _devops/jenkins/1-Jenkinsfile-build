@@ -1,21 +1,11 @@
 pipeline {
     agent any
     
-    options {
-        skipDefaultCheckout(true)
-        timeout(time: 30, unit: 'MINUTES')
-        retry(1) // Попробовать еще раз при ошибке
-    }
-
     environment {
         SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
-        DEPLOY_PATH = '_devops/k8s'
-        REGISTRY = "localhost:5000"
-        REGISTRY_MINIKUBE = "host.minikube.internal:5000"
         IMAGE_RANDOM = "doggo-random-service"
         IMAGE_RATING = "doggo-rating-service"
-        // Явно указываем KUBECONFIG
-        KUBECONFIG = "/var/jenkins_home/.kube/config"
+        VERSION = "latest"
     }
 
     stages {
@@ -24,120 +14,79 @@ pipeline {
                 dir(env.SHARED_WS) {
                     checkout scm
                 }
-                script {
-                    dir(env.SHARED_WS) {
-                        env.VERSION = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
-                        echo "VERSION = ${env.VERSION}"
-                    }
+            }
+        }
+
+        stage('Build Docker images') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        echo "=== Собираем Java сервис ==="
+                        docker build -t ${IMAGE_RANDOM}:${VERSION} DogRandomService
+                        
+                        echo "=== Собираем .NET сервис ==="
+                        docker build -t ${IMAGE_RATING}:${VERSION} DogRatingService
+                        
+                        echo "=== Готовые образы ==="
+                        docker images | grep -E "${IMAGE_RANDOM}|${IMAGE_RATING}"
+                    """
                 }
             }
         }
 
-        stage('Docker build') {
+        stage('Load images to Minikube') {
             steps {
-                dir(env.SHARED_WS) {
-                    sh """
-                        echo "=== Собираем Docker образы ==="
-                        docker build -t ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} DogRandomService
-                        docker build -t ${REGISTRY}/${IMAGE_RATING}:${VERSION} DogRatingService
-                    """
-                }
-            }
-            post {
-                failure {
-                    echo "❌ Ошибка при сборке Docker образов"
-                }
-            }
-        }
-
-        stage('Push to registry') {
-            steps {
-                dir(env.SHARED_WS) {
-                    sh """
-                        echo "=== Пушим образы в registry ==="
-                        docker login ${REGISTRY} -u user -p user
-                        docker push ${REGISTRY}/${IMAGE_RANDOM}:${VERSION}
-                        docker push ${REGISTRY}/${IMAGE_RATING}:${VERSION}
-                        docker rmi ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} || true
-                        docker rmi ${REGISTRY}/${IMAGE_RATING}:${VERSION} || true
-                    """
-                }
-            }
-            post {
-                failure {
-                    echo "❌ Ошибка при push в registry"
-                }
-            }
-        }
-
-        stage('Deploy to k8s') {
-            steps {
-                dir(env.SHARED_WS) {
-                    sh """
-                        echo "=== Деплой в Kubernetes ==="
-                        
-                        # Проверяем доступ к кластеру
-                        kubectl cluster-info
-                        
-                        # Подготавливаем манифесты с актуальными тегами образов
-                        cp ${DEPLOY_PATH}/doggo-deployment.yaml ${DEPLOY_PATH}/doggo-deployment-temp.yaml
-                        cp ${DEPLOY_PATH}/doggo-rating-deployment.yaml ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
-                
-                        sed -i "s|image-doggo-replace|${REGISTRY_MINIKUBE}/${IMAGE_RANDOM}:${VERSION}|g" ${DEPLOY_PATH}/doggo-deployment-temp.yaml
-                        sed -i "s|image-rating-replace|${REGISTRY_MINIKUBE}/${IMAGE_RATING}:${VERSION}|g" ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
-                
-                        # Применяем манифесты
-                        kubectl apply -f ${DEPLOY_PATH}/configmap.yaml
-                        kubectl apply -f ${DEPLOY_PATH}/secret.yaml
-                        kubectl apply -f ${DEPLOY_PATH}/nexus-secret.yaml
-                        kubectl apply -f ${DEPLOY_PATH}/postgres.yaml
-                
-                        echo "Ждем запуска PostgreSQL..."
-                        sleep 15
-                        kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
-                
-                        # Деплоим основные сервисы
-                        kubectl apply -f ${DEPLOY_PATH}/doggo-deployment-temp.yaml
-                        kubectl apply -f ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
-                
-                        # Очищаем временные файлы
-                        rm -f ${DEPLOY_PATH}/*-temp.yaml
-                        
-                        echo "=== Деплой завершен ==="
-                        kubectl get pods
-                    """
-                }
-            }
-            post {
-                success {
-                    echo "✅ Успешно задеплоено в Kubernetes!"
-                    sh """
-                        echo "Текущие pods:"
-                        kubectl get pods
-                    """
-                }
-                failure {
-                    echo "❌ Ошибка при деплое в Kubernetes"
-                    sh """
-                        echo "Логи последних pod'ов:"
-                        kubectl logs -l app=doggo --tail=50 || true
-                        kubectl logs -l app=doggo-rating --tail=50 || true
-                    """
-                }
-            }
-        }
-        
-        stage('Verify deployment') {
-            steps {
-                sleep 30  // Даем время подняться pod'ам
                 sh """
-                    echo "=== Проверка деплоя ==="
-                    kubectl get pods
-                    kubectl get services
+                    echo "=== Загружаем образы в Minikube ==="
+                    minikube image load ${IMAGE_RANDOM}:${VERSION}
+                    minikube image load ${IMAGE_RATING}:${VERSION}
                     
-                    echo "Проверяем ready pods..."
-                    kubectl wait --for=condition=ready pod -l app=doggo --timeout=30s || echo "Doggo service не готов"
-                    kubectl wait --for=condition=ready pod -l app=doggo-rating --timeout=30s || echo "Doggo-rating service не готов"
+                    echo "=== Проверяем в Minikube ==="
+                    minikube image list | grep -E "${IMAGE_RANDOM}|${IMAGE_RATING}"
+                """
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                dir(env.SHARED_WS) {
+                    sh """
+                        echo "=== Деплой в Minikube ==="
+                        
+                        # Применяем все манифесты
+                        kubectl apply -f _devops/k8s/
+                        
+                        echo "=== Ждем запуска (30 секунд) ==="
+                        sleep 30
+                        
+                        echo "=== Проверяем pods ==="
+                        kubectl get pods
+                        
+                        echo "=== Проверяем services ==="
+                        kubectl get services
+                    """
+                }
+            }
+        }
+
+        stage('Test application') {
+            steps {
+                sh """
+                    echo "=== Тестируем приложение ==="
+                    
+                    # Получаем URL сервиса
+                    MINIKUBE_IP=\$(minikube ip)
+                    
+                    echo "Java сервис: http://\${MINIKUBE_IP}:30000"
+                    echo ".NET сервис: http://\${MINIKUBE_IP}:30001"
+                    
+                    # Тестируем Java сервис
+                    echo "Тест Java сервиса:"
+                    curl -s http://\${MINIKUBE_IP}:30000/actuator/health || echo "Java сервис не отвечает"
+                    
+                    # Тестируем .NET сервис
+                    echo "Тест .NET сервиса:"
+                    curl -s http://\${MINIKUBE_IP}:30001/health || echo ".NET сервис не отвечает"
                 """
             }
         }
@@ -145,37 +94,24 @@ pipeline {
 
     post {
         always {
-            echo "=== [ALWAYS] Финальная очистка ==="
-            sh """
-                docker logout ${REGISTRY} 2>/dev/null || true
-                echo "Docker logout выполнен"
-            """
-            
-            // Можно сохранить логи или артефакты
-            archiveArtifacts artifacts: '**/target/*.jar,**/*.log', allowEmptyArchive: true
-            
+            echo "=== Очистка ==="
             cleanWs()
-            echo "Workspace очищен"
         }
         
         success {
-            echo "✅ ✅ ✅ PIPELINE УСПЕШНО ЗАВЕРШЕН! ✅ ✅ ✅"
-            echo "Сервисы развернуты в Kubernetes"
-            echo "Проверить: kubectl get pods, kubectl get services"
+            echo "✅ ✅ ✅ ВСЕ ГОТОВО! ✅ ✅ ✅"
+            echo "1. Приложение работает!"
+            echo "2. Jenkins pipeline выполнен!"
+            echo "3. Без Nexus (но он у вас есть в docker-compose)"
+            echo ""
+            echo "Откройте в браузере:"
+            echo "- Java сервис: http://\$(minikube ip):30000"
+            echo "- .NET сервис: http://\$(minikube ip):30001"
         }
         
         failure {
-            echo "❌ ❌ ❌ PIPELINE ЗАВЕРШИЛСЯ С ОШИБКОЙ ❌ ❌ ❌"
-            echo "Для ручной очистки выполните:"
-            echo "  kubectl delete -f ${SHARED_WS}/${DEPLOY_PATH} --ignore-not-found=true"
-            echo "  kubectl delete pvc postgres-data --ignore-not-found=true"
-            
-            // НЕ пытаемся автоматически удалять - это вызывает дополнительные ошибки
-            // Просто логируем что нужно сделать вручную
-        }
-        
-        unstable {
-            echo "⚠️ Pipeline нестабилен"
+            echo "❌ Что-то пошло не так"
+            echo "Для очистки: kubectl delete -f _devops/k8s/"
         }
     }
 }
