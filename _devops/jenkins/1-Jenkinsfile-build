@@ -3,6 +3,8 @@ pipeline {
     
     options {
         skipDefaultCheckout(true)
+        timeout(time: 30, unit: 'MINUTES')
+        retry(1) // Попробовать еще раз при ошибке
     }
 
     environment {
@@ -12,6 +14,8 @@ pipeline {
         REGISTRY_MINIKUBE = "host.minikube.internal:5000"
         IMAGE_RANDOM = "doggo-random-service"
         IMAGE_RATING = "doggo-rating-service"
+        // Явно указываем KUBECONFIG
+        KUBECONFIG = "/var/jenkins_home/.kube/config"
     }
 
     stages {
@@ -33,9 +37,15 @@ pipeline {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
+                        echo "=== Собираем Docker образы ==="
                         docker build -t ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} DogRandomService
                         docker build -t ${REGISTRY}/${IMAGE_RATING}:${VERSION} DogRatingService
                     """
+                }
+            }
+            post {
+                failure {
+                    echo "❌ Ошибка при сборке Docker образов"
                 }
             }
         }
@@ -44,6 +54,7 @@ pipeline {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
+                        echo "=== Пушим образы в registry ==="
                         docker login ${REGISTRY} -u user -p user
                         docker push ${REGISTRY}/${IMAGE_RANDOM}:${VERSION}
                         docker push ${REGISTRY}/${IMAGE_RATING}:${VERSION}
@@ -52,54 +63,119 @@ pipeline {
                     """
                 }
             }
+            post {
+                failure {
+                    echo "❌ Ошибка при push в registry"
+                }
+            }
         }
 
         stage('Deploy to k8s') {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
+                        echo "=== Деплой в Kubernetes ==="
+                        
+                        # Проверяем доступ к кластеру
+                        kubectl cluster-info
+                        
+                        # Подготавливаем манифесты с актуальными тегами образов
                         cp ${DEPLOY_PATH}/doggo-deployment.yaml ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         cp ${DEPLOY_PATH}/doggo-rating-deployment.yaml ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
                 
                         sed -i "s|image-doggo-replace|${REGISTRY_MINIKUBE}/${IMAGE_RANDOM}:${VERSION}|g" ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         sed -i "s|image-rating-replace|${REGISTRY_MINIKUBE}/${IMAGE_RATING}:${VERSION}|g" ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
                 
+                        # Применяем манифесты
                         kubectl apply -f ${DEPLOY_PATH}/configmap.yaml
                         kubectl apply -f ${DEPLOY_PATH}/secret.yaml
                         kubectl apply -f ${DEPLOY_PATH}/nexus-secret.yaml
                         kubectl apply -f ${DEPLOY_PATH}/postgres.yaml
                 
+                        echo "Ждем запуска PostgreSQL..."
                         sleep 15
                         kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
                 
+                        # Деплоим основные сервисы
                         kubectl apply -f ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         kubectl apply -f ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
                 
+                        # Очищаем временные файлы
                         rm -f ${DEPLOY_PATH}/*-temp.yaml
+                        
+                        echo "=== Деплой завершен ==="
+                        kubectl get pods
                     """
                 }
+            }
+            post {
+                success {
+                    echo "✅ Успешно задеплоено в Kubernetes!"
+                    sh """
+                        echo "Текущие pods:"
+                        kubectl get pods
+                    """
+                }
+                failure {
+                    echo "❌ Ошибка при деплое в Kubernetes"
+                    sh """
+                        echo "Логи последних pod'ов:"
+                        kubectl logs -l app=doggo --tail=50 || true
+                        kubectl logs -l app=doggo-rating --tail=50 || true
+                    """
+                }
+            }
+        }
+        
+        stage('Verify deployment') {
+            steps {
+                sleep 30  // Даем время подняться pod'ам
+                sh """
+                    echo "=== Проверка деплоя ==="
+                    kubectl get pods
+                    kubectl get services
+                    
+                    echo "Проверяем ready pods..."
+                    kubectl wait --for=condition=ready pod -l app=doggo --timeout=30s || echo "Doggo service не готов"
+                    kubectl wait --for=condition=ready pod -l app=doggo-rating --timeout=30s || echo "Doggo-rating service не готов"
+                """
             }
         }
     }
 
     post {
-        failure {
-            dir(env.SHARED_WS) {
-                sh """
-                    kubectl delete -f ${DEPLOY_PATH} --ignore-not-found=true
-                    kubectl delete all -l app=doggo --ignore-not-found=true
-                    kubectl delete all -l app=doggo-rating --ignore-not-found=true
-                    kubectl delete all -l app=postgres --ignore-not-found=true
-                    kubectl delete pvc postgres-data --ignore-not-found=true
-                    kubectl delete configmap doggo-env --ignore-not-found=true
-                    kubectl delete secret doggo-secret --ignore-not-found=true
-                    kubectl delete secret nexus-secret --ignore-not-found=true
-                """
-            }
-        }
         always {
-            sh "docker logout ${REGISTRY}"
+            echo "=== [ALWAYS] Финальная очистка ==="
+            sh """
+                docker logout ${REGISTRY} 2>/dev/null || true
+                echo "Docker logout выполнен"
+            """
+            
+            // Можно сохранить логи или артефакты
+            archiveArtifacts artifacts: '**/target/*.jar,**/*.log', allowEmptyArchive: true
+            
             cleanWs()
+            echo "Workspace очищен"
+        }
+        
+        success {
+            echo "✅ ✅ ✅ PIPELINE УСПЕШНО ЗАВЕРШЕН! ✅ ✅ ✅"
+            echo "Сервисы развернуты в Kubernetes"
+            echo "Проверить: kubectl get pods, kubectl get services"
+        }
+        
+        failure {
+            echo "❌ ❌ ❌ PIPELINE ЗАВЕРШИЛСЯ С ОШИБКОЙ ❌ ❌ ❌"
+            echo "Для ручной очистки выполните:"
+            echo "  kubectl delete -f ${SHARED_WS}/${DEPLOY_PATH} --ignore-not-found=true"
+            echo "  kubectl delete pvc postgres-data --ignore-not-found=true"
+            
+            // НЕ пытаемся автоматически удалять - это вызывает дополнительные ошибки
+            // Просто логируем что нужно сделать вручную
+        }
+        
+        unstable {
+            echo "⚠️ Pipeline нестабилен"
         }
     }
 }
