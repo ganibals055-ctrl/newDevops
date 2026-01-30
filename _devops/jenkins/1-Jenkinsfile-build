@@ -21,29 +21,29 @@ pipeline {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
-                        echo "=== Собираем Java сервис ==="
+                        echo "=== Собираем Docker образы ==="
                         docker build -t ${IMAGE_RANDOM}:${VERSION} DogRandomService
-                        
-                        echo "=== Собираем .NET сервис ==="
                         docker build -t ${IMAGE_RATING}:${VERSION} DogRatingService
-                        
-                        echo "=== Готовые образы ==="
-                        docker images | grep -E "${IMAGE_RANDOM}|${IMAGE_RATING}"
                     """
                 }
             }
         }
 
-        stage('Load images to Minikube') {
+        stage('Prepare K8s manifests') {
             steps {
-                sh """
-                    echo "=== Загружаем образы в Minikube ==="
-                    minikube image load ${IMAGE_RANDOM}:${VERSION}
-                    minikube image load ${IMAGE_RATING}:${VERSION}
-                    
-                    echo "=== Проверяем в Minikube ==="
-                    minikube image list | grep -E "${IMAGE_RANDOM}|${IMAGE_RATING}"
-                """
+                dir(env.SHARED_WS) {
+                    sh """
+                        echo "=== Подготавливаем манифесты ==="
+                        
+                        # Создаем временные файлы с правильными именами образов
+                        cp _devops/k8s/doggo-deployment.yaml _devops/k8s/doggo-deployment-temp.yaml
+                        cp _devops/k8s/doggo-rating-deployment.yaml _devops/k8s/doggo-rating-deployment-temp.yaml
+                        
+                        # Заменяем плейсхолдеры на реальные имена образов
+                        sed -i 's|image-doggo-replace|${IMAGE_RANDOM}:${VERSION}|g' _devops/k8s/doggo-deployment-temp.yaml
+                        sed -i 's|image-rating-replace|${IMAGE_RATING}:${VERSION}|g' _devops/k8s/doggo-rating-deployment-temp.yaml
+                    """
+                }
             }
         }
 
@@ -51,21 +51,48 @@ pipeline {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
-                        echo "=== Деплой в Minikube ==="
+                        echo "=== Деплой в Kubernetes ==="
                         
-                        # Применяем все манифесты
-                        kubectl apply -f _devops/k8s/
+                        # Применяем базовые конфиги
+                        kubectl apply -f _devops/k8s/configmap.yaml
+                        kubectl apply -f _devops/k8s/secret.yaml
+                        kubectl apply -f _devops/k8s/postgres.yaml
                         
-                        echo "=== Ждем запуска (30 секунд) ==="
-                        sleep 30
+                        echo "Ждем запуска PostgreSQL (15 секунд)..."
+                        sleep 15
                         
-                        echo "=== Проверяем pods ==="
+                        # Применяем основные сервисы
+                        kubectl apply -f _devops/k8s/doggo-deployment-temp.yaml
+                        kubectl apply -f _devops/k8s/doggo-rating-deployment-temp.yaml
+                        
+                        echo "=== Проверяем deployment ==="
+                        kubectl get deployments
                         kubectl get pods
-                        
-                        echo "=== Проверяем services ==="
                         kubectl get services
                     """
                 }
+            }
+        }
+
+        stage('Wait for pods') {
+            steps {
+                sh """
+                    echo "=== Ждем пока поды запустятся ==="
+                    
+                    # Ждем максимум 60 секунд
+                    timeout 60 bash -c '
+                        while true; do
+                            READY=\$(kubectl get pods -o jsonpath="{.items[*].status.conditions[?(@.type==\"Ready\")].status}" | grep -c "True")
+                            TOTAL=\$(kubectl get pods -o jsonpath="{.items[*].metadata.name}" | wc -w)
+                            if [ "\$READY" -eq "\$TOTAL" ] && [ "\$TOTAL" -gt 0 ]; then
+                                echo "✓ Все \$TOTAL pod\'ов запущены"
+                                break
+                            fi
+                            echo "Готово: \$READY/\$TOTAL"
+                            sleep 5
+                        done
+                    '
+                """
             }
         }
 
@@ -74,19 +101,21 @@ pipeline {
                 sh """
                     echo "=== Тестируем приложение ==="
                     
-                    # Получаем URL сервиса
-                    MINIKUBE_IP=\$(minikube ip)
+                    # Получаем NodePortы
+                    JAVA_PORT=\$(kubectl get service doggo -o jsonpath='{.spec.ports[0].nodePort}')
+                    DOTNET_PORT=\$(kubectl get service doggo-rating -o jsonpath='{.spec.ports[0].nodePort}')
                     
-                    echo "Java сервис: http://\${MINIKUBE_IP}:30000"
-                    echo ".NET сервис: http://\${MINIKUBE_IP}:30001"
+                    # Получаем IP Minikube через kubectl
+                    MINIKUBE_IP=\$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
                     
-                    # Тестируем Java сервис
-                    echo "Тест Java сервиса:"
-                    curl -s http://\${MINIKUBE_IP}:30000/actuator/health || echo "Java сервис не отвечает"
+                    echo "Java сервис: http://\${MINIKUBE_IP}:\${JAVA_PORT}"
+                    echo ".NET сервис: http://\${MINIKUBE_IP}:\${DOTNET_PORT}"
                     
-                    # Тестируем .NET сервис
-                    echo "Тест .NET сервиса:"
-                    curl -s http://\${MINIKUBE_IP}:30001/health || echo ".NET сервис не отвечает"
+                    echo "Тест Java сервиса (health):"
+                    curl -f -m 10 http://\${MINIKUBE_IP}:\${JAVA_PORT}/actuator/health && echo "✓ Java сервис работает" || echo "✗ Java сервис не отвечает"
+                    
+                    echo "Тест .NET сервиса (health):"
+                    curl -f -m 10 http://\${MINIKUBE_IP}:\${DOTNET_PORT}/health && echo "✓ .NET сервис работает" || echo "✗ .NET сервис не отвечает"
                 """
             }
         }
@@ -95,23 +124,36 @@ pipeline {
     post {
         always {
             echo "=== Очистка ==="
+            sh """
+                # Удаляем временные файлы
+                rm -f _devops/k8s/*-temp.yaml 2>/dev/null || true
+            """
             cleanWs()
         }
         
         success {
             echo "✅ ✅ ✅ ВСЕ ГОТОВО! ✅ ✅ ✅"
-            echo "1. Приложение работает!"
-            echo "2. Jenkins pipeline выполнен!"
-            echo "3. Без Nexus (но он у вас есть в docker-compose)"
-            echo ""
-            echo "Откройте в браузере:"
-            echo "- Java сервис: http://\$(minikube ip):30000"
-            echo "- .NET сервис: http://\$(minikube ip):30001"
+            echo "Приложение развернуто в Kubernetes!"
+            
+            sh """
+                echo "=== Итоговая информация ==="
+                echo "Pods:"
+                kubectl get pods
+                echo ""
+                echo "Services:"
+                kubectl get services
+                echo ""
+                echo "Для доступа:"
+                echo "Java:  http://\$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'):\$(kubectl get service doggo -o jsonpath='{.spec.ports[0].nodePort}')"
+                echo ".NET: http://\$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'):\$(kubectl get service doggo-rating -o jsonpath='{.spec.ports[0].nodePort}')"
+            """
         }
         
         failure {
-            echo "❌ Что-то пошло не так"
-            echo "Для очистки: kubectl delete -f _devops/k8s/"
+            echo "❌ Pipeline завершился с ошибкой"
+            echo "Для очистки выполните:"
+            echo "  kubectl delete -f _devops/k8s/ --ignore-not-found=true"
+            echo "  kubectl delete pvc postgres-data --ignore-not-found=true"
         }
     }
 }
