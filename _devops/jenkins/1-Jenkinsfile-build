@@ -4,35 +4,22 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         timeout(time: 30, unit: 'MINUTES')
-        retry(1)
+        retry(1) // Попробовать еще раз при ошибке
     }
 
     environment {
         SHARED_WS = '/var/jenkins_home/workspace/doggo_nexus'
         DEPLOY_PATH = '_devops/k8s'
-        NEXUS_PATH = '_devops/nexus'
-        
-        // Пробуем разные адреса для Nexus
-        NEXUS_HOST = "host.docker.internal"  # для Docker контейнеров
-        // ИЛИ если Jenkins на хосте: localhost
-        // ИЛИ если в Minikube: host.minikube.internal
-        
-        REGISTRY_PORT = "5000"
-        NEXUS_UI_PORT = "8081"
-        
+        REGISTRY = "localhost:5000"
+        REGISTRY_MINIKUBE = "host.minikube.internal:5000"
         IMAGE_RANDOM = "doggo-random-service"
         IMAGE_RATING = "doggo-rating-service"
-        
-        // Credentials для Nexus
-        NEXUS_USER = "user"
-        NEXUS_PASSWORD = "user"
-        
-        // Minikube registry (для деплоя в k8s)
-        REGISTRY_MINIKUBE = "host.minikube.internal:5000"
+        // Явно указываем KUBECONFIG
+        KUBECONFIG = "/var/jenkins_home/.kube/config"
     }
 
     stages {
-        stage('Checkout and Setup') {
+        stage('Checkout') {
             steps {
                 dir(env.SHARED_WS) {
                     checkout scm
@@ -46,166 +33,60 @@ pipeline {
             }
         }
 
-        stage('Start Nexus if needed') {
-            steps {
-                dir(env.SHARED_WS) {
-                    sh """
-                        echo "=== Проверяем Nexus ==="
-                        
-                        # Проверяем, запущен ли уже Nexus
-                        if docker ps | grep -q nexus3; then
-                            echo "✓ Nexus уже запущен"
-                        else
-                            echo "Запускаем Nexus из папки ${NEXUS_PATH}..."
-                            cd ${NEXUS_PATH}
-                            docker-compose up -d
-                            sleep 10  # Ждем запуска
-                        fi
-                        
-                        # Проверяем доступность
-                        echo "Проверяем доступность Nexus UI..."
-                        if curl -s --retry 5 --retry-delay 3 --max-time 10 http://${NEXUS_HOST}:${NEXUS_UI_PORT} > /dev/null; then
-                            echo "✓ Nexus UI доступен"
-                        else
-                            echo "✗ Nexus UI недоступен по адресу http://${NEXUS_HOST}:${NEXUS_UI_PORT}"
-                            echo "Пробуем localhost..."
-                            if curl -s --max-time 5 http://localhost:${NEXUS_UI_PORT} > /dev/null; then
-                                echo "✓ Nexus доступен через localhost"
-                                export NEXUS_HOST="localhost"
-                            else
-                                echo "Проверьте что Nexus запущен: docker-compose up в папке nexus"
-                                exit 1
-                            fi
-                        fi
-                    """
-                }
-            }
-        }
-
-        stage('Configure Nexus Docker Registry') {
-            steps {
-                dir(env.SHARED_WS) {
-                    sh """
-                        echo "=== Настраиваем Docker Registry в Nexus ==="
-                        
-                        # Ждем полного запуска Nexus
-                        sleep 5
-                        
-                        # Проверяем доступность Docker registry
-                        echo "Проверяем Docker registry порт ${REGISTRY_PORT}..."
-                        if curl -s --max-time 5 http://${NEXUS_HOST}:${REGISTRY_PORT}/v2/ > /dev/null; then
-                            echo "✓ Docker registry доступен"
-                        else
-                            echo "⚠️  Docker registry не отвечает. Возможно нужно настроить в Nexus UI:"
-                            echo "    1. Откройте http://${NEXUS_HOST}:${NEXUS_UI_PORT}"
-                            echo "    2. Создайте Docker (hosted) репозиторий на порту ${REGISTRY_PORT}"
-                            echo "    3. Разрешите anonymous access"
-                        fi
-                    """
-                }
-            }
-        }
-
         stage('Docker build') {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
                         echo "=== Собираем Docker образы ==="
-                        
-                        # Собираем Java сервис
-                        echo "Сборка ${IMAGE_RANDOM}..."
-                        docker build -t ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RANDOM}:${VERSION} DogRandomService
-                        
-                        # Собираем .NET сервис
-                        echo "Сборка ${IMAGE_RATING}..."
-                        docker build -t ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RATING}:${VERSION} DogRatingService
-                        
-                        # Выводим список образов
-                        echo "Собранные образы:"
-                        docker images | grep "${NEXUS_HOST}:${REGISTRY_PORT}"
+                        docker build -t ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} DogRandomService
+                        docker build -t ${REGISTRY}/${IMAGE_RATING}:${VERSION} DogRatingService
                     """
+                }
+            }
+            post {
+                failure {
+                    echo "❌ Ошибка при сборке Docker образов"
                 }
             }
         }
 
-        stage('Push to Nexus registry') {
+        stage('Push to registry') {
             steps {
                 dir(env.SHARED_WS) {
                     sh """
-                        echo "=== Пушим образы в Nexus ==="
-                        echo "Registry: ${NEXUS_HOST}:${REGISTRY_PORT}"
-                        
-                        # Добавляем insecure registry если нужно
-                        echo "Настраиваем Docker для работы с insecure registry..."
-                        
-                        # Логинимся в Nexus Docker registry
-                        echo "Логин в Nexus..."
-                        if docker login ${NEXUS_HOST}:${REGISTRY_PORT} -u ${NEXUS_USER} -p ${NEXUS_PASSWORD}; then
-                            echo "✓ Успешный логин"
-                        else
-                            echo "⚠️  Ошибка логина. Пробуем без аутентификации..."
-                            # Пробуем push без логина (если разрешен anonymous)
-                        fi
-                        
-                        # Пушим образы
-                        echo "Push ${IMAGE_RANDOM}..."
-                        docker push ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RANDOM}:${VERSION} || {
-                            echo "⚠️  Ошибка push. Возможно нужно добавить insecure registry:"
-                            echo '    Добавьте в /etc/docker/daemon.json:'
-                            echo '    { "insecure-registries": ["'${NEXUS_HOST}:${REGISTRY_PORT}'"] }'
-                            echo '    И перезапустите Docker: sudo systemctl restart docker'
-                            exit 1
-                        }
-                        
-                        echo "Push ${IMAGE_RATING}..."
-                        docker push ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RATING}:${VERSION}
-                        
-                        echo "✓ Образы успешно загружены в Nexus"
-                        
-                        # Очищаем локальные образы чтобы не занимать место
-                        docker rmi ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RANDOM}:${VERSION} || true
-                        docker rmi ${NEXUS_HOST}:${REGISTRY_PORT}/${IMAGE_RATING}:${VERSION} || true
+                        echo "=== Пушим образы в registry ==="
+                        docker login ${REGISTRY} -u user -p user
+                        docker push ${REGISTRY}/${IMAGE_RANDOM}:${VERSION}
+                        docker push ${REGISTRY}/${IMAGE_RATING}:${VERSION}
+                        docker rmi ${REGISTRY}/${IMAGE_RANDOM}:${VERSION} || true
+                        docker rmi ${REGISTRY}/${IMAGE_RATING}:${VERSION} || true
                     """
                 }
             }
-            
             post {
                 failure {
-                    echo "❌ Ошибка при работе с Nexus registry"
-                    echo "Проверьте:"
-                    echo "1. Nexus запущен: docker-compose up в папке nexus"
-                    echo "2. Docker registry настроен в Nexus UI"
-                    echo "3. Docker daemon настроен на insecure registry"
+                    echo "❌ Ошибка при push в registry"
                 }
             }
         }
 
         stage('Deploy to k8s') {
-            when {
-                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
-            }
             steps {
                 dir(env.SHARED_WS) {
                     sh """
                         echo "=== Деплой в Kubernetes ==="
                         
-                        # Проверяем доступ к Kubernetes
-                        kubectl cluster-info || {
-                            echo "✗ Нет доступа к Kubernetes"
-                            echo "Убедитесь что kubectl настроен"
-                            exit 1
-                        }
+                        # Проверяем доступ к кластеру
+                        kubectl cluster-info
                         
-                        # Подготавливаем манифесты с актуальными тегами
-                        echo "Подготовка манифестов..."
+                        # Подготавливаем манифесты с актуальными тегами образов
                         cp ${DEPLOY_PATH}/doggo-deployment.yaml ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         cp ${DEPLOY_PATH}/doggo-rating-deployment.yaml ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
                 
-                        # Заменяем теги образов
                         sed -i "s|image-doggo-replace|${REGISTRY_MINIKUBE}/${IMAGE_RANDOM}:${VERSION}|g" ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         sed -i "s|image-rating-replace|${REGISTRY_MINIKUBE}/${IMAGE_RATING}:${VERSION}|g" ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
-                        
-                        echo "Применяем базовые конфигурации..."
+                
+                        # Применяем манифесты
                         kubectl apply -f ${DEPLOY_PATH}/configmap.yaml
                         kubectl apply -f ${DEPLOY_PATH}/secret.yaml
                         kubectl apply -f ${DEPLOY_PATH}/nexus-secret.yaml
@@ -213,9 +94,9 @@ pipeline {
                 
                         echo "Ждем запуска PostgreSQL..."
                         sleep 15
-                        kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s || echo "PostgreSQL не запустился в timeout"
+                        kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
                 
-                        echo "Деплоим основные сервисы..."
+                        # Деплоим основные сервисы
                         kubectl apply -f ${DEPLOY_PATH}/doggo-deployment-temp.yaml
                         kubectl apply -f ${DEPLOY_PATH}/doggo-rating-deployment-temp.yaml
                 
@@ -227,34 +108,34 @@ pipeline {
                     """
                 }
             }
-            
             post {
                 success {
                     echo "✅ Успешно задеплоено в Kubernetes!"
+                    sh """
+                        echo "Текущие pods:"
+                        kubectl get pods
+                    """
                 }
                 failure {
                     echo "❌ Ошибка при деплое в Kubernetes"
+                    sh """
+                        echo "Логи последних pod'ов:"
+                        kubectl logs -l app=doggo --tail=50 || true
+                        kubectl logs -l app=doggo-rating --tail=50 || true
+                    """
                 }
             }
         }
         
         stage('Verify deployment') {
-            when {
-                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
-            }
             steps {
                 sleep 30  // Даем время подняться pod'ам
                 sh """
                     echo "=== Проверка деплоя ==="
-                    echo "Статус pods:"
                     kubectl get pods
-                    
-                    echo ""
-                    echo "Статус services:"
                     kubectl get services
                     
-                    echo ""
-                    echo "Проверяем готовность сервисов..."
+                    echo "Проверяем ready pods..."
                     kubectl wait --for=condition=ready pod -l app=doggo --timeout=30s || echo "Doggo service не готов"
                     kubectl wait --for=condition=ready pod -l app=doggo-rating --timeout=30s || echo "Doggo-rating service не готов"
                 """
@@ -265,20 +146,14 @@ pipeline {
     post {
         always {
             echo "=== [ALWAYS] Финальная очистка ==="
-            
             sh """
-                # Выходим из Docker registry
-                docker logout ${NEXUS_HOST}:${REGISTRY_PORT} 2>/dev/null || true
+                docker logout ${REGISTRY} 2>/dev/null || true
                 echo "Docker logout выполнен"
-                
-                # Останавливаем Nexus если мы его запускали (опционально)
-                # cd ${SHARED_WS}/${NEXUS_PATH} && docker-compose down 2>/dev/null || true
             """
             
-            # Сохраняем артефакты если нужно
+            // Можно сохранить логи или артефакты
             archiveArtifacts artifacts: '**/target/*.jar,**/*.log', allowEmptyArchive: true
             
-            # Очищаем workspace
             cleanWs()
             echo "Workspace очищен"
         }
@@ -286,21 +161,21 @@ pipeline {
         success {
             echo "✅ ✅ ✅ PIPELINE УСПЕШНО ЗАВЕРШЕН! ✅ ✅ ✅"
             echo "Сервисы развернуты в Kubernetes"
-            echo "Образы сохранены в Nexus: ${NEXUS_HOST}:${REGISTRY_PORT}"
-            echo "Для проверки: kubectl get pods, kubectl get services"
+            echo "Проверить: kubectl get pods, kubectl get services"
         }
         
         failure {
             echo "❌ ❌ ❌ PIPELINE ЗАВЕРШИЛСЯ С ОШИБКОЙ ❌ ❌ ❌"
-            echo "Диагностика:"
-            echo "1. Nexus: docker-compose up в папке ${NEXUS_PATH}"
-            echo "2. Проверьте настройки Docker daemon для insecure registry"
-            echo "3. Kubernetes: kubectl cluster-info"
-            
-            echo ""
             echo "Для ручной очистки выполните:"
             echo "  kubectl delete -f ${SHARED_WS}/${DEPLOY_PATH} --ignore-not-found=true"
             echo "  kubectl delete pvc postgres-data --ignore-not-found=true"
+            
+            // НЕ пытаемся автоматически удалять - это вызывает дополнительные ошибки
+            // Просто логируем что нужно сделать вручную
+        }
+        
+        unstable {
+            echo "⚠️ Pipeline нестабилен"
         }
     }
 }
